@@ -36,7 +36,13 @@ from rich.progress import (
 from rich.progress import track
 from fastq2bcl import __version__
 from fastq2bcl.parser import parse_seqdesc_fields
-from fastq2bcl.reader import read_first_record, read_fastq_files, get_mask_from_files
+from fastq2bcl.reader import (
+    read_first_record,
+    get_mask_from_files,
+    iter_fastq_records,
+    iter_fastq_cycle_data,
+    count_fastq_records,
+)
 from fastq2bcl.writer import (
     write_run_info_xml,
     write_filter,
@@ -57,6 +63,27 @@ _logger = logging.getLogger(__name__)
 # Python scripts/interactive interpreter, e.g. via
 # `from fastq2bcl.skeleton import fib`,
 # when using this Python module as a library.
+
+
+def _write_cycle_from_fastq(context, progress, task_id):
+    """
+    Process-pool helper that streams FASTQ records for one BCL cycle.
+    """
+    (
+        cycle,
+        cluster_count,
+        rundir,
+        r1,
+        r2,
+        i1,
+        i2,
+        exclude_umi,
+        exclude_index,
+    ) = context
+    cycle_data = iter_fastq_cycle_data(
+        cycle, r1, r2, i1, i2, exclude_umi, exclude_index
+    )
+    write_cycle((cycle, cluster_count, rundir, cycle_data), progress, task_id)
 
 
 def fastq2bcl(
@@ -148,11 +175,12 @@ def fastq2bcl(
 
     print(f"[green]MASK[/green]: {mask_string}")
 
-    # READ SEQUENCES
-    sequences, positions = read_fastq_files(r1, r2, i1, i2, exclude_umi, exclude_index)
-
     # SET MASK FROM STRING
     mask = set_mask(mask_string)
+    cycles = sum([int(m["cycles"]) for m in mask])
+
+    # Count clusters without keeping FASTQ records in memory.
+    cluster_count = count_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index)
 
     # WRITE RUN INFO
     _logger.info(f"Writing RunInfo.mxl to dir: {rundir}")
@@ -170,29 +198,37 @@ def fastq2bcl(
     # WRITE FILTER
     print(f"[bold magenta]Writing filter file [/bold magenta]")
     _logger.info(
-        f"Writing filter file to dir: {rundir} with cluster count: {len(sequences)}"
+        f"Writing filter file to dir: {rundir} with cluster count: {cluster_count}"
     )
-    write_filter(rundir, len(sequences))
+    write_filter(rundir, cluster_count)
 
     # WRITE CONTROL
     print(f"[bold magenta]Writing control file [/bold magenta]")
     _logger.info(
-        f"Writing control file to dir: {rundir} with cluster count: {len(sequences)}"
+        f"Writing control file to dir: {rundir} with cluster count: {cluster_count}"
     )
-    write_control(rundir, len(sequences))
+    write_control(rundir, cluster_count)
 
     # WRITE LOCATIONS
     print(f"[bold magenta]Writing location file [/bold magenta]")
-    _logger.info(f"Writing {len(positions)} locations to dir: {rundir}")
-    write_locs(rundir, positions)
+    _logger.info(f"Writing {cluster_count} locations to dir: {rundir}")
+    positions_count = write_locs(
+        rundir,
+        (
+            position
+            for _sequence, position in iter_fastq_records(
+                r1, r2, i1, i2, exclude_umi, exclude_index
+            )
+        ),
+    )
+    if positions_count != cluster_count:
+        raise ValueError(
+            f"Location count {positions_count} does not match cluster count {cluster_count}"
+        )
 
     # WRITE BCL AND STATS with threadss
     print(f"[bold magenta]Writing cycles files with {threads} threads[/bold magenta]")
-    _logger.info(f"Writing {len(sequences)} sequences bcl and stats to dir: {rundir}")
-
-    # count cycles and clusters
-    cycles = len(sequences[0][0])
-    cluster_count = len(sequences)
+    _logger.info(f"Writing {cluster_count} sequences bcl and stats to dir: {rundir}")
 
     # PARALLEL WRITE OF BCL FILES
     # Using workers to write files.
@@ -225,17 +261,21 @@ def fastq2bcl(
                     for cycle in range(cycles):
                         # set visible false so we don't have a lot of bars all at once:
                         task_id = progress.add_task(f"cycle {cycle+1}", visible=False)
-                        # build the data required by write_cycle
-                        # TODO optimize
-                        cycle_data = []
-                        for basecalls, qualscores in sequences:
-                            if cycle >= len(basecalls):
-                                cycle_data.append(("N", 0))
-                            else:
-                                cycle_data.append((basecalls[cycle], qualscores[cycle]))
-                        context = (cycle, cluster_count, rundir, cycle_data)
+                        context = (
+                            cycle,
+                            cluster_count,
+                            rundir,
+                            r1,
+                            r2,
+                            i1,
+                            i2,
+                            exclude_umi,
+                            exclude_index,
+                        )
                         futures.append(
-                            executor.submit(write_cycle, context, _progress, task_id)
+                            executor.submit(
+                                _write_cycle_from_fastq, context, _progress, task_id
+                            )
                         )
                     # monitor the progress:
                     while (
@@ -271,7 +311,17 @@ def fastq2bcl(
             _logger.info(
                 f"Creating bcl file for cycle #{cycle+1} with {cluster_count} clusters"
             )
-            write_bcl_and_stats(cycle, cluster_count, rundir, sequences)
+            write_bcl_and_stats(
+                cycle,
+                cluster_count,
+                rundir,
+                (
+                    sequence
+                    for sequence, _position in iter_fastq_records(
+                        r1, r2, i1, i2, exclude_umi, exclude_index
+                    )
+                ),
+            )
 
     return run_id, rundir, seqdesc_fields, mask_string
 

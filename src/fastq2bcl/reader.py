@@ -84,37 +84,24 @@ def get_mask_from_files(r1, r2, i1, i2, exclude_umi, exclude_index):
     return mask
 
 
-def read_fastq_files(r1, r2, i1, i2, exclude_umi, exclude_index):
+def iter_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index):
     """
-    Read fastq files R1-R2 with I1 and I2 and return only the data we need
-    """
-    # return a list of tuple with seq, qual
-    # and a list of tuple for pos with x and y
-    # SINGLE R1
-    # sequences = [('AAAA',1111)]
-    # positions = [(1,1)]
-    #
-    # in case of multiple files R1-R2:
-    # PAIR R1-R2
-    # sequences = [('AAAABBBB',11111111)]
-    # positions = [(1,1)]
-    #
-    # I need way to handle multiple files and merge them in a single with exitstack
-    # Ref https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack
+    Stream fastq files R1-R2 with I1 and I2 and yield only the data we need.
 
+    Each yielded item is ``((sequence, quality), (x_pos, y_pos))``.
+    """
     # build a list of iterators
     file_handlers = get_file_handlers(r1, r2, i1, i2)
     seq_iterators = [SeqIO.parse(fh, "fastq") for fh in file_handlers]
-
-    # output Lists
-    sequences = []
-    positions = []
 
     try:
         # iterate over the R1 iterator
         for r1_record in seq_iterators[0]:
             # call next in additional iterators
-            opt_data = [next(iterator) for iterator in seq_iterators[1:]]
+            try:
+                opt_data = [next(iterator) for iterator in seq_iterators[1:]]
+            except StopIteration:
+                raise ValueError("FASTQ files do not contain the same number of records")
 
             # store R1 data
             record_fields = parse_seqdesc_fields(r1_record.description)
@@ -145,13 +132,65 @@ def read_fastq_files(r1, r2, i1, i2, exclude_umi, exclude_index):
                 record_seq += str(opt_record.seq)
                 record_qual += opt_record.letter_annotations["phred_quality"]
 
-            # append cluster position
-            positions.append((record_fields["x_pos"], record_fields["y_pos"]))
-            # append sequence and qual
-            sequences.append((record_seq, record_qual))
+            yield (record_seq, record_qual), (
+                record_fields["x_pos"],
+                record_fields["y_pos"],
+            )
     finally:
         # close all files
         for file_fh in file_handlers:
             file_fh.close()
+
+
+def iter_fastq_cycle_data(cycle, r1, r2, i1, i2, exclude_umi, exclude_index):
+    """
+    Stream ``(base, quality)`` values for a single BCL cycle.
+    """
+    for (basecalls, qualscores), _position in iter_fastq_records(
+        r1, r2, i1, i2, exclude_umi, exclude_index
+    ):
+        if cycle >= len(basecalls):
+            yield ("N", 0)
+        else:
+            yield (basecalls[cycle], qualscores[cycle])
+
+
+def count_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index):
+    """
+    Count records without retaining FASTQ data in memory.
+    """
+    return sum(
+        1
+        for _record in iter_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index)
+    )
+
+
+def read_fastq_files(r1, r2, i1, i2, exclude_umi, exclude_index):
+    """
+    Read fastq files R1-R2 with I1 and I2 and return only the data we need
+    """
+    # return a list of tuple with seq, qual
+    # and a list of tuple for pos with x and y
+    # SINGLE R1
+    # sequences = [('AAAA',1111)]
+    # positions = [(1,1)]
+    #
+    # in case of multiple files R1-R2:
+    # PAIR R1-R2
+    # sequences = [('AAAABBBB',11111111)]
+    # positions = [(1,1)]
+    #
+    # I need way to handle multiple files and merge them in a single with exitstack
+    # Ref https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack
+
+    # output Lists
+    sequences = []
+    positions = []
+
+    for sequence, position in iter_fastq_records(
+        r1, r2, i1, i2, exclude_umi, exclude_index
+    ):
+        positions.append(position)
+        sequences.append(sequence)
 
     return (sequences, positions)
