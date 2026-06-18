@@ -152,9 +152,7 @@ def test_read_first_record():
 
 
 def test_read_single_fastq_files():
-    seq, pos = read_fastq_files(
-        "data/test/01_single/test_single.fastq.gz", None, None, None, True, True
-    )
+    seq, pos = read_fastq_files("data/test/01_single/test_single.fastq.gz", None, None, None, True, True)
     assert seq == expected_data_single_seq
     assert pos == expected_data_single_pos
 

@@ -20,10 +20,10 @@ __license__ = "MIT"
 
 excepted_xml = """<?xml version="1.0"?>
 <RunInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" Version="2">
-    <Run Id="YYMMDD_M11111_0222_000000000-K9H97" Number="222">
+    <Run Id="100101_M11111_0222_000000000-K9H97" Number="222">
         <Flowcell>000000000-K9H97</Flowcell>
         <Instrument>M11111</Instrument>
-        <Date>YYMMDD</Date>
+        <Date>100101</Date>
         <Reads>
             <Read NumCycles="110" Number="1" IsIndexedRead="N" />
         </Reads>
@@ -34,9 +34,7 @@ excepted_xml = """<?xml version="1.0"?>
 
 expected_filter = b"\x00\x00\x00\x00\x03\x00\x00\x00\x01\x00\x00\x00\x01"
 expected_control = b"\x00\x00\x00\x00\x02\x00\x00\x00\x01\x00\x00\x00\x00\x00"
-expected_locs = (
-    b"\x01\x00\x00\x00\x00\x00\x80?\x01\x00\x00\x00\xcd\xcc\xc7\xc2\xcd\xcc\xc7\xc2"
-)
+expected_locs = b"\x01\x00\x00\x00\x00\x00\x80?\x01\x00\x00\x00\xcd\xcc\xc7\xc2\xcd\xcc\xc7\xc2"
 expected_bcl = b"\x01\x00\x00\x00\x05"
 expected_stats = b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
 
@@ -53,7 +51,7 @@ expected_cluster_count = b"\x01\x00\x00\x00"
 def test_generate_run_info_xml():
     assert (
         generate_run_info_xml(
-            "YYMMDD_M11111_0222_000000000-K9H97",
+            "100101_M11111_0222_000000000-K9H97",
             222,
             "000000000-K9H97",
             "M11111",
@@ -67,7 +65,7 @@ def test_write_run_info_xml(tmp_path):
     xmlout = tmp_path / "RunInfo.xml"
     write_run_info_xml(
         tmp_path,
-        "YYMMDD_M11111_0222_000000000-K9H97",
+        "100101_M11111_0222_000000000-K9H97",
         222,
         "000000000-K9H97",
         "M11111",
@@ -134,10 +132,7 @@ def test_write_cycle(tmp_path):
 
 
 def test_get_cycle_dir(tmp_path):
-    assert (
-        get_cycle_dir(tmp_path, 10)
-        == tmp_path / f"Data/Intensities/BaseCalls/L001/C11.1"
-    )
+    assert get_cycle_dir(tmp_path, 10) == tmp_path / f"Data/Intensities/BaseCalls/L001/C11.1"
 
 
 def test_append_data_to_bcl(tmp_path):

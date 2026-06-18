@@ -13,8 +13,10 @@ References:
     - https://setuptools.pypa.io/en/latest/userguide/entry_point.html
     - https://pip.pypa.io/en/stable/reference/pip_install
 """
+
 import signal
 import argparse
+import csv
 import logging
 import sys
 import os
@@ -40,7 +42,6 @@ from fastq2bcl.reader import (
     read_first_record,
     get_mask_from_files,
     iter_fastq_records,
-    iter_fastq_cycle_data,
     count_fastq_records,
 )
 from fastq2bcl.writer import (
@@ -50,6 +51,7 @@ from fastq2bcl.writer import (
     write_locs,
     write_bcl_and_stats,
     write_cycle,
+    write_sample_sheet,
 )
 
 __author__ = "Davide Rambaldi"
@@ -73,17 +75,260 @@ def _write_cycle_from_fastq(context, progress, task_id):
         cycle,
         cluster_count,
         rundir,
-        r1,
-        r2,
-        i1,
-        i2,
+        lane_samples,
         exclude_umi,
         exclude_index,
+        lane,
     ) = context
-    cycle_data = iter_fastq_cycle_data(
-        cycle, r1, r2, i1, i2, exclude_umi, exclude_index
+    cycle_data = _iter_lane_cycle_data(cycle, lane, lane_samples, exclude_umi, exclude_index)
+    write_cycle((cycle, cluster_count, rundir, cycle_data, lane), progress, task_id)
+
+
+def _is_lane_token(value):
+    if value == None:
+        return False
+    parts = re.split(r"[;,]", value)
+    numeric_parts = [part.strip() for part in parts if part.strip()]
+    return bool(numeric_parts) and all(part.isdigit() for part in numeric_parts)
+
+
+def _parse_lanes(values):
+    lanes = []
+    for value in values:
+        for part in re.split(r"[;,]", value):
+            part = part.strip()
+            if part:
+                lanes.append(int(part))
+    if not lanes:
+        raise ValueError("Input samplesheet row does not define any lanes")
+    if len(lanes) != len(set(lanes)):
+        raise ValueError("Input samplesheet row assigns the same lane more than once")
+    invalid_lanes = [lane for lane in lanes if lane < 1 or lane > 8]
+    if invalid_lanes:
+        raise ValueError(
+            "Input samplesheet lanes must be between 1 and 8; invalid lanes: "
+            + ",".join(str(lane) for lane in sorted(set(invalid_lanes)))
+        )
+    return lanes
+
+
+def _optional_path(value, base_dir):
+    if value == None or value == "":
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        path = base_dir / path
+    return path
+
+
+def _sample_id_from_path(path):
+    name = Path(path).name
+    for suffix in (".fastq.gz", ".fq.gz", ".fastq", ".fq"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return re.sub(r"([._-])R1([._-].*)?$", "", name)
+
+
+def parse_input_samplesheet(input_samplesheet):
+    """
+    Parse lane,r1,r2,i1,i2[,project][,sample] input samplesheet rows.
+
+    Lane lists can be semicolon-separated in one cell or comma-separated across
+    leading numeric CSV cells, e.g. ``1;2;3;4,5,6,7,file_R1.fastq.gz,...``.
+    Additional columns are ignored.
+    """
+    samplesheet = Path(input_samplesheet)
+    base_dir = samplesheet.parent
+    samples = []
+    with open(samplesheet, newline="") as f_in:
+        reader = csv.reader(f_in)
+        header = next(reader, None)
+        normalized_header = [h.strip() for h in header] if header != None else []
+        if normalized_header[:5] != [
+            "lane",
+            "r1",
+            "r2",
+            "i1",
+            "i2",
+        ]:
+            raise ValueError("Input samplesheet header must start with: lane,r1,r2,i1,i2")
+        value_header = normalized_header[1:]
+
+        for row_number, row in enumerate(reader, start=2):
+            if not row or all(cell.strip() == "" for cell in row):
+                continue
+            first_fastq_idx = None
+            for idx, value in enumerate(row):
+                if not _is_lane_token(value.strip()):
+                    first_fastq_idx = idx
+                    break
+            if first_fastq_idx == None:
+                raise ValueError(f"Input samplesheet row {row_number} has no R1 path")
+
+            lane_values = row[:first_fastq_idx]
+            values = [cell.strip() for cell in row[first_fastq_idx:]]
+            row_data = {name: "" for name in value_header}
+            row_data.update(dict(zip(value_header, values)))
+            lanes = _parse_lanes(lane_values)
+
+            r1 = _optional_path(row_data["r1"], base_dir)
+            if r1 == None:
+                raise ValueError(f"Input samplesheet row {row_number} has no R1 path")
+            sample_id = row_data.get("sample") or _sample_id_from_path(r1)
+            samples.append(
+                {
+                    "lanes": lanes,
+                    "r1": r1,
+                    "r2": _optional_path(row_data["r2"], base_dir),
+                    "i1": _optional_path(row_data["i1"], base_dir),
+                    "i2": _optional_path(row_data["i2"], base_dir),
+                    "sample_id": sample_id,
+                    "sample_name": sample_id,
+                    "project": row_data.get("project", ""),
+                }
+            )
+
+    if not samples:
+        raise ValueError("Input samplesheet does not contain any samples")
+    return samples
+
+
+def _samples_by_lane(samples):
+    lane_samples = {}
+    for sample in samples:
+        for lane in sample["lanes"]:
+            lane_samples.setdefault(lane, []).append(sample)
+    return lane_samples
+
+
+def _sample_record_count(sample, exclude_umi, exclude_index):
+    cache_key = "_record_count"
+    if cache_key not in sample:
+        sample[cache_key] = count_fastq_records(
+            sample["r1"],
+            sample["r2"],
+            sample["i1"],
+            sample["i2"],
+            exclude_umi,
+            exclude_index,
+        )
+    return sample[cache_key]
+
+
+def _sample_lane_bounds(sample, lane, exclude_umi, exclude_index):
+    lanes = sample["lanes"]
+    if len(lanes) == 1:
+        return 0, _sample_record_count(sample, exclude_umi, exclude_index)
+
+    lane_index = lanes.index(lane)
+    record_count = _sample_record_count(sample, exclude_umi, exclude_index)
+    chunk_size, extra_records = divmod(record_count, len(lanes))
+    start = (lane_index * chunk_size) + min(lane_index, extra_records)
+    end = start + chunk_size + (1 if lane_index < extra_records else 0)
+    return start, end
+
+
+def _iter_sample_lane_records(sample, lane, exclude_umi, exclude_index):
+    start, end = _sample_lane_bounds(sample, lane, exclude_umi, exclude_index)
+    if start == end:
+        return
+
+    for record_index, record in enumerate(
+        iter_fastq_records(
+            sample["r1"],
+            sample["r2"],
+            sample["i1"],
+            sample["i2"],
+            exclude_umi,
+            exclude_index,
+        )
+    ):
+        if record_index >= end:
+            break
+        if record_index >= start:
+            yield record
+
+
+def _iter_lane_records(lane, lane_samples, exclude_umi, exclude_index):
+    for sample in lane_samples:
+        yield from _iter_sample_lane_records(sample, lane, exclude_umi, exclude_index)
+
+
+def _iter_lane_cycle_data(cycle, lane, lane_samples, exclude_umi, exclude_index):
+    for (basecalls, qualscores), _position in _iter_lane_records(lane, lane_samples, exclude_umi, exclude_index):
+        if cycle >= len(basecalls):
+            yield ("N", 0)
+        else:
+            yield (basecalls[cycle], qualscores[cycle])
+
+
+def _count_lane_records(lane, lane_samples, exclude_umi, exclude_index):
+    return sum(
+        _sample_lane_bounds(sample, lane, exclude_umi, exclude_index)[1]
+        - _sample_lane_bounds(sample, lane, exclude_umi, exclude_index)[0]
+        for sample in lane_samples
     )
-    write_cycle((cycle, cluster_count, rundir, cycle_data), progress, task_id)
+
+
+def _sample_index_key(sample):
+    index_parts = []
+    try:
+        seqdesc_fields = parse_seqdesc_fields(read_first_record(sample["r1"]).description)
+    except StopIteration:
+        return None
+    if seqdesc_fields["index"] != "1":
+        index_parts.append(seqdesc_fields["index"])
+    if sample["i1"] != None:
+        index_parts.append(str(read_first_record(sample["i1"]).seq))
+    if sample["i2"] != None:
+        index_parts.append(str(read_first_record(sample["i2"]).seq))
+    if not index_parts:
+        return None
+    return tuple(index_parts)
+
+
+def _validate_shared_lane_indexes(samples_by_lane, exclude_index):
+    for lane, lane_samples in samples_by_lane.items():
+        if len(lane_samples) < 2:
+            continue
+        if exclude_index:
+            raise ValueError(
+                f"Lane {lane} has multiple samples; --exclude-index would remove "
+                "the indexes required to demultiplex them"
+            )
+
+        seen_indexes = {}
+        for sample in lane_samples:
+            index_key = _sample_index_key(sample)
+            if index_key == None:
+                if _sample_record_count(sample, False, exclude_index) == 0:
+                    continue
+                raise ValueError(
+                    f"Lane {lane} has multiple samples, but sample " f"{sample['sample_id']} does not define an index"
+                )
+            if index_key in seen_indexes:
+                raise ValueError(
+                    f"Lane {lane} has multiple samples with duplicate index "
+                    f"{'/'.join(index_key)}: {seen_indexes[index_key]} and "
+                    f"{sample['sample_id']}"
+                )
+            seen_indexes[index_key] = sample["sample_id"]
+
+
+def _samples_from_fastq_args(r1, r2, i1, i2):
+    return [
+        {
+            "lanes": [1],
+            "r1": Path(r1),
+            "r2": Path(r2) if r2 != None else None,
+            "i1": Path(i1) if i1 != None else None,
+            "i2": Path(i2) if i2 != None else None,
+            "sample_id": _sample_id_from_path(r1),
+            "sample_name": _sample_id_from_path(r1),
+            "project": "",
+        }
+    ]
 
 
 def fastq2bcl(
@@ -96,6 +341,8 @@ def fastq2bcl(
     exclude_umi=False,
     exclude_index=False,
     threads=1,
+    input_samplesheet=None,
+    sample_sheet_format="bcl2fastq",
 ):
     """fastq2bcl function call
 
@@ -122,10 +369,19 @@ def fastq2bcl(
 
     _logger.info(f"Output directory: {outdir}")
 
+    if input_samplesheet:
+        samples = parse_input_samplesheet(input_samplesheet)
+    else:
+        if r1 == None:
+            raise ValueError("Either r1 or input_samplesheet must be provided")
+        samples = _samples_from_fastq_args(r1, r2, i1, i2)
+
+    first_sample = samples[0]
+    first_r1 = first_sample["r1"]
+
     # Validate R1 and extract first read
-    r1 = Path(r1)
-    assert r1.is_file()
-    first_record = read_first_record(r1)
+    assert first_r1.is_file()
+    first_record = read_first_record(first_r1)
     seqdesc_fields = parse_seqdesc_fields(first_record.description)
     _logger.info(f"first record seq length: {len(first_record.seq)}")
     _logger.info(f"first record sequence: {str(first_record.seq)}")
@@ -170,7 +426,14 @@ def fastq2bcl(
 
     if not mask_string:
         # get cycles string from files
-        mask_string = get_mask_from_files(r1, r2, i1, i2, exclude_umi, exclude_index)
+        mask_string = get_mask_from_files(
+            first_sample["r1"],
+            first_sample["r2"],
+            first_sample["i1"],
+            first_sample["i2"],
+            exclude_umi,
+            exclude_index,
+        )
         _logger.info(f"mask string from files: {mask_string}")
 
     print(f"[green]MASK[/green]: {mask_string}")
@@ -178,9 +441,9 @@ def fastq2bcl(
     # SET MASK FROM STRING
     mask = set_mask(mask_string)
     cycles = sum([int(m["cycles"]) for m in mask])
-
-    # Count clusters without keeping FASTQ records in memory.
-    cluster_count = count_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index)
+    samples_by_lane = _samples_by_lane(samples)
+    _validate_shared_lane_indexes(samples_by_lane, exclude_index)
+    lane_count = max(samples_by_lane)
 
     # WRITE RUN INFO
     _logger.info(f"Writing RunInfo.mxl to dir: {rundir}")
@@ -191,136 +454,51 @@ def fastq2bcl(
         seqdesc_fields["flowcell_id"],
         seqdesc_fields["instrument"],
         mask,
+        lane_count,
     )
 
     print(f"[green]RunInfo.xml:[/green]:\n", run_info)
+    write_sample_sheet(rundir, samples, mask, sample_sheet_format, exclude_index)
 
-    # WRITE FILTER
-    print(f"[bold magenta]Writing filter file [/bold magenta]")
-    _logger.info(
-        f"Writing filter file to dir: {rundir} with cluster count: {cluster_count}"
-    )
-    write_filter(rundir, cluster_count)
+    for lane, lane_samples in sorted(samples_by_lane.items()):
+        cluster_count = _count_lane_records(lane, lane_samples, exclude_umi, exclude_index)
 
-    # WRITE CONTROL
-    print(f"[bold magenta]Writing control file [/bold magenta]")
-    _logger.info(
-        f"Writing control file to dir: {rundir} with cluster count: {cluster_count}"
-    )
-    write_control(rundir, cluster_count)
+        # WRITE FILTER
+        print(f"[bold magenta]Writing filter file for lane {lane}[/bold magenta]")
+        _logger.info(f"Writing filter file to dir: {rundir} with cluster count: {cluster_count}")
+        write_filter(rundir, cluster_count, lane)
 
-    # WRITE LOCATIONS
-    print(f"[bold magenta]Writing location file [/bold magenta]")
-    _logger.info(f"Writing {cluster_count} locations to dir: {rundir}")
-    positions_count = write_locs(
-        rundir,
-        (
-            position
-            for _sequence, position in iter_fastq_records(
-                r1, r2, i1, i2, exclude_umi, exclude_index
-            )
-        ),
-    )
-    if positions_count != cluster_count:
-        raise ValueError(
-            f"Location count {positions_count} does not match cluster count {cluster_count}"
+        # WRITE CONTROL
+        print(f"[bold magenta]Writing control file for lane {lane}[/bold magenta]")
+        _logger.info(f"Writing control file to dir: {rundir} with cluster count: {cluster_count}")
+        write_control(rundir, cluster_count, lane)
+
+        # WRITE LOCATIONS
+        print(f"[bold magenta]Writing location file for lane {lane}[/bold magenta]")
+        _logger.info(f"Writing {cluster_count} locations to dir: {rundir}")
+        positions_count = write_locs(
+            rundir,
+            (position for _sequence, position in _iter_lane_records(lane, lane_samples, exclude_umi, exclude_index)),
+            lane,
         )
+        if positions_count != cluster_count:
+            raise ValueError(f"Location count {positions_count} does not match cluster count {cluster_count}")
 
-    # WRITE BCL AND STATS with threadss
-    print(f"[bold magenta]Writing cycles files with {threads} threads[/bold magenta]")
-    _logger.info(f"Writing {cluster_count} sequences bcl and stats to dir: {rundir}")
+        # WRITE BCL AND STATS with threads
+        print(f"[bold magenta]Writing cycles files for lane {lane} with {threads} threads[/bold magenta]")
+        _logger.info(f"Writing {cluster_count} sequences bcl and stats to dir: {rundir}")
 
-    # PARALLEL WRITE OF BCL FILES
-    # Using workers to write files.
-    # Each worker should write a cycle file with clusters init
-    # 1. init bcl file with cluster_count
-    # 2. write the cycle: all clusters data for the position (cycle)
-    # 3. write stat file
-    #
-    # For each cycle pass to the read the data in a tuple (cycle, clusters_base, clusters_quality)
-    if threads > 1:
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeRemainingColumn(),
-            TimeElapsedColumn(),
-            refresh_per_second=1,  # bit slower updates
-        ) as progress:
-            futures = []  # keep track of the jobs
-            with multiprocessing.Manager() as manager:
-                # this is the key - we share some state between our
-                # main process and our worker functions
-                _progress = manager.dict()
-                overall_progress_task = progress.add_task(
-                    "[green]All jobs progress:[/green]"
-                )
-
-                with ProcessPoolExecutor(max_workers=threads) as executor:
-                    # iterate over the jobs we need to run
-                    for cycle in range(cycles):
-                        # set visible false so we don't have a lot of bars all at once:
-                        task_id = progress.add_task(f"cycle {cycle+1}", visible=False)
-                        context = (
-                            cycle,
-                            cluster_count,
-                            rundir,
-                            r1,
-                            r2,
-                            i1,
-                            i2,
-                            exclude_umi,
-                            exclude_index,
-                        )
-                        futures.append(
-                            executor.submit(
-                                _write_cycle_from_fastq, context, _progress, task_id
-                            )
-                        )
-                    # monitor the progress:
-                    while (
-                        n_finished := sum([future.done() for future in futures])
-                    ) < len(futures):
-                        progress.update(
-                            overall_progress_task,
-                            completed=n_finished,
-                            total=len(futures),
-                        )
-
-                        for task_id, update_data in _progress.items():
-                            latest = update_data["progress"]
-                            total = update_data["total"]
-                            # update the progress bar for this task:
-                            progress.update(
-                                task_id,
-                                completed=latest,
-                                total=total,
-                                visible=latest < total,
-                            )
-
-                    # wait for all tasks to complete by getting all results
-                    for future in futures:
-                        future.result()
-
-    else:
-        # single thread mode
         for cycle in track(
             range(cycles),
             description="[bold magenta]Initialize bcl files with cluster counts ...[/bold magenta]",
         ):
-            _logger.info(
-                f"Creating bcl file for cycle #{cycle+1} with {cluster_count} clusters"
-            )
+            _logger.info(f"Creating bcl file for cycle #{cycle+1} with {cluster_count} clusters")
             write_bcl_and_stats(
                 cycle,
                 cluster_count,
                 rundir,
-                (
-                    sequence
-                    for sequence, _position in iter_fastq_records(
-                        r1, r2, i1, i2, exclude_umi, exclude_index
-                    )
-                ),
+                (sequence for sequence, _position in _iter_lane_records(lane, lane_samples, exclude_umi, exclude_index)),
+                lane,
             )
 
     return run_id, rundir, seqdesc_fields, mask_string
@@ -330,14 +508,7 @@ def mock_run_id(fields):
     """
     Mock the run directory id and Path
     """
-    run_id = (
-        "YYMMDD_"
-        + fields["instrument"]
-        + "_"
-        + fields["run_number"].zfill(4)
-        + "_"
-        + fields["flowcell_id"]
-    )
+    run_id = "100101_" + fields["instrument"] + "_" + fields["run_number"].zfill(4) + "_" + fields["flowcell_id"]
     return run_id
 
 
@@ -403,9 +574,7 @@ def parse_args(args):
         action="store_const",
         const=logging.DEBUG,
     )
-    parser.add_argument(
-        "-m", "--mask", dest="mask", help="define mask in format 110N10Y10Y110N"
-    )
+    parser.add_argument("-m", "--mask", dest="mask", help="define mask in format 110N10Y10Y110N")
 
     parser.add_argument(
         "-r1",
@@ -413,7 +582,20 @@ def parse_args(args):
         dest="r1",
         help="fastq.gz with R1 reads",
         metavar="R1",
-        required=True,
+    )
+
+    parser.add_argument(
+        "--input_samplesheet",
+        dest="input_samplesheet",
+        help="CSV with lane,r1,r2,i1,i2 rows assigning FASTQ files to lanes",
+    )
+
+    parser.add_argument(
+        "--sample-sheet-format",
+        dest="sample_sheet_format",
+        choices=["bcl2fastq", "bcl-convert"],
+        default="bcl2fastq",
+        help="Generated SampleSheet.csv format. default: bcl2fastq",
     )
 
     parser.add_argument(
@@ -471,7 +653,10 @@ def parse_args(args):
         dest="threads",
     )
 
-    return parser.parse_args(args)
+    parsed_args = parser.parse_args(args)
+    if parsed_args.input_samplesheet == None and parsed_args.r1 == None:
+        parser.error("Either --input_samplesheet or -r1/--read-1 is required")
+    return parsed_args
 
 
 def setup_logging(loglevel):
@@ -481,9 +666,7 @@ def setup_logging(loglevel):
       loglevel (int): minimum loglevel for emitting messages
     """
     logformat = "[%(asctime)s] %(levelname)s:%(name)s:%(message)s"
-    logging.basicConfig(
-        level=loglevel, stream=sys.stdout, format=logformat, datefmt="%Y-%m-%d %H:%M:%S"
-    )
+    logging.basicConfig(level=loglevel, stream=sys.stdout, format=logformat, datefmt="%Y-%m-%d %H:%M:%S")
 
 
 def main(args):
@@ -518,6 +701,8 @@ def main(args):
         args.exclude_umi,
         args.exclude_index,
         args.threads,
+        args.input_samplesheet,
+        args.sample_sheet_format,
     )
 
     _logger.info("Script ends here")
@@ -532,14 +717,4 @@ def run():
 
 
 if __name__ == "__main__":
-    # ^  This is a guard statement that will prevent the following code from
-    #    being executed in the case someone imports this file instead of
-    #    executing it as a script.
-    #    https://docs.python.org/3/library/__main__.html
-
-    # After installing your project with pip, users can also run your Python
-    # modules as scripts via the ``-m`` flag, as defined in PEP 338::
-    #
-    #     python -m fastq2bcl.skeleton 42
-    #
     run()

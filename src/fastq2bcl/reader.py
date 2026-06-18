@@ -46,9 +46,7 @@ def get_mask_from_files(r1, r2, i1, i2, exclude_umi, exclude_index):
     # check errors on index for R1
     if seq_fields["index"] != "1" and not exclude_index:
         if i1 != None or i2 != None:
-            raise ValueError(
-                "Usage of index from sequence desc and I1 and I2 files at the same time is not supported"
-            )
+            raise ValueError("Usage of index from sequence desc and I1 and I2 files at the same time is not supported")
         # continue and write to index I1 length TODO I2 for double index
         print(f"LENGTH INDEX {seq_fields['index']}")
         index_1_bases += len(seq_fields["index"])
@@ -56,9 +54,7 @@ def get_mask_from_files(r1, r2, i1, i2, exclude_umi, exclude_index):
     # check errors on UMI for R1
     if seq_fields["UMI"] != None and not exclude_umi:
         if i1 != None or i2 != None:
-            raise ValueError(
-                "Usage of UMI from sequence desc and I1 and I2 files at the same time is not supported"
-            )
+            raise ValueError("Usage of UMI from sequence desc and I1 and I2 files at the same time is not supported")
         # continue and write to index I1
         index_1_bases += len(seq_fields["UMI"])
 
@@ -126,9 +122,7 @@ def iter_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index):
 
             for opt_record in opt_data:
                 if opt_record.id != record_id:
-                    raise ValueError(
-                        f"Seq ID mismatch for record {opt_record.id} R1 is {record_id}"
-                    )
+                    raise ValueError(f"Seq ID mismatch for record {opt_record.id} R1 is {record_id}")
                 record_seq += str(opt_record.seq)
                 record_qual += opt_record.letter_annotations["phred_quality"]
 
@@ -146,9 +140,7 @@ def iter_fastq_cycle_data(cycle, r1, r2, i1, i2, exclude_umi, exclude_index):
     """
     Stream ``(base, quality)`` values for a single BCL cycle.
     """
-    for (basecalls, qualscores), _position in iter_fastq_records(
-        r1, r2, i1, i2, exclude_umi, exclude_index
-    ):
+    for (basecalls, qualscores), _position in iter_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index):
         if cycle >= len(basecalls):
             yield ("N", 0)
         else:
@@ -159,10 +151,7 @@ def count_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index):
     """
     Count records without retaining FASTQ data in memory.
     """
-    return sum(
-        1
-        for _record in iter_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index)
-    )
+    return sum(1 for _record in iter_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index))
 
 
 def read_fastq_files(r1, r2, i1, i2, exclude_umi, exclude_index):
@@ -187,9 +176,7 @@ def read_fastq_files(r1, r2, i1, i2, exclude_umi, exclude_index):
     sequences = []
     positions = []
 
-    for sequence, position in iter_fastq_records(
-        r1, r2, i1, i2, exclude_umi, exclude_index
-    ):
+    for sequence, position in iter_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index):
         positions.append(position)
         sequences.append(sequence)
 

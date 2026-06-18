@@ -76,7 +76,7 @@ FASTQ sample sequence::
 
 Structure of an illumina run directory::
 
-    YYMMDD_M11111_0222_000000000-K9H97
+    100101_M11111_0222_000000000-K9H97
     ├── Data
     │   └── Intensities
     │       ├── BaseCalls
@@ -148,10 +148,10 @@ For exammple, if I give as input 2 pairs with length 300 bp and 2 indexes with l
 
     <?xml version="1.0"?>
     <RunInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" Version="2">
-        <Run Id="YYMMDD_run_0001_ABCD" Number="1">
+        <Run Id="100101_run_0001_ABCD" Number="1">
             <Flowcell>ABCD</Flowcell>
             <Instrument>run</Instrument>
-            <Date>YYMMDD</Date>
+            <Date>100101</Date>
             <Reads>
                 <Read c="300" Number="1" IsIndexedRead="N" />
                 <Read NumCycles="8" Number="2" IsIndexedRead="Y" />

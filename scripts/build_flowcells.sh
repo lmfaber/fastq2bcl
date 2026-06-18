@@ -104,7 +104,7 @@ case "$command" in
                     fastq2bcl -o $BUILD_DIR/$dirname $command_args > $BUILD_DIR/$dirname/fastq2blc.log 2>&1
 
                     # resulting RUNDIR
-                    RUNDIR="$BUILD_DIR/$dirname"/YYMMDD_*
+                    RUNDIR="$BUILD_DIR/$dirname"/100101_*
                     echo "copying SampleSheet to $RUNDIR"
                     cp $dir/*.csv $RUNDIR
 
