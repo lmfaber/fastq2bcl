@@ -22,20 +22,9 @@ import sys
 import os
 import re
 import textwrap
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
 
 from pathlib import Path
 from rich import print, pretty
-from rich.progress import (
-    Progress,
-    TextColumn,
-    BarColumn,
-    TaskProgressColumn,
-    TimeRemainingColumn,
-    TimeElapsedColumn,
-)
-from rich.progress import track
 from fastq2bcl import __version__
 from fastq2bcl.parser import parse_seqdesc_fields
 from fastq2bcl.reader import (
@@ -48,10 +37,8 @@ from fastq2bcl.writer import (
     write_run_info_xml,
     write_filter,
     write_control,
-    write_locs,
-    write_bcl_and_stats,
-    write_cycle,
     write_sample_sheet,
+    write_lane_bcls_and_locs,
 )
 
 __author__ = "Davide Rambaldi"
@@ -59,30 +46,6 @@ __copyright__ = "Davide Rambaldi"
 __license__ = "MIT"
 
 _logger = logging.getLogger(__name__)
-
-# ---- Python API ----
-# The functions defined in this section can be imported by users in their
-# Python scripts/interactive interpreter, e.g. via
-# `from fastq2bcl.skeleton import fib`,
-# when using this Python module as a library.
-
-
-def _write_cycle_from_fastq(context, progress, task_id):
-    """
-    Process-pool helper that streams FASTQ records for one BCL cycle.
-    """
-    (
-        cycle,
-        cluster_count,
-        rundir,
-        lane_samples,
-        exclude_umi,
-        exclude_index,
-        lane,
-    ) = context
-    cycle_data = _iter_lane_cycle_data(cycle, lane, lane_samples, exclude_umi, exclude_index)
-    write_cycle((cycle, cluster_count, rundir, cycle_data, lane), progress, task_id)
-
 
 def _is_lane_token(value):
     if value == None:
@@ -255,20 +218,12 @@ def _iter_lane_records(lane, lane_samples, exclude_umi, exclude_index):
         yield from _iter_sample_lane_records(sample, lane, exclude_umi, exclude_index)
 
 
-def _iter_lane_cycle_data(cycle, lane, lane_samples, exclude_umi, exclude_index):
-    for (basecalls, qualscores), _position in _iter_lane_records(lane, lane_samples, exclude_umi, exclude_index):
-        if cycle >= len(basecalls):
-            yield ("N", 0)
-        else:
-            yield (basecalls[cycle], qualscores[cycle])
-
-
 def _count_lane_records(lane, lane_samples, exclude_umi, exclude_index):
-    return sum(
-        _sample_lane_bounds(sample, lane, exclude_umi, exclude_index)[1]
-        - _sample_lane_bounds(sample, lane, exclude_umi, exclude_index)[0]
-        for sample in lane_samples
-    )
+    total = 0
+    for sample in lane_samples:
+        start, end = _sample_lane_bounds(sample, lane, exclude_umi, exclude_index)
+        total += end - start
+    return total
 
 
 def _sample_index_key(sample):
@@ -473,33 +428,16 @@ def fastq2bcl(
         _logger.info(f"Writing control file to dir: {rundir} with cluster count: {cluster_count}")
         write_control(rundir, cluster_count, lane)
 
-        # WRITE LOCATIONS
-        print(f"[bold magenta]Writing location file for lane {lane}[/bold magenta]")
-        _logger.info(f"Writing {cluster_count} locations to dir: {rundir}")
-        positions_count = write_locs(
+        # WRITE LOCATIONS, BCL AND STATS
+        print(f"[bold magenta]Writing location and cycle files for lane {lane}[/bold magenta]")
+        _logger.info(f"Writing {cluster_count} records to dir: {rundir}")
+        write_lane_bcls_and_locs(
             rundir,
-            (position for _sequence, position in _iter_lane_records(lane, lane_samples, exclude_umi, exclude_index)),
+            cluster_count,
+            cycles,
+            _iter_lane_records(lane, lane_samples, exclude_umi, exclude_index),
             lane,
         )
-        if positions_count != cluster_count:
-            raise ValueError(f"Location count {positions_count} does not match cluster count {cluster_count}")
-
-        # WRITE BCL AND STATS with threads
-        print(f"[bold magenta]Writing cycles files for lane {lane} with {threads} threads[/bold magenta]")
-        _logger.info(f"Writing {cluster_count} sequences bcl and stats to dir: {rundir}")
-
-        for cycle in track(
-            range(cycles),
-            description="[bold magenta]Initialize bcl files with cluster counts ...[/bold magenta]",
-        ):
-            _logger.info(f"Creating bcl file for cycle #{cycle+1} with {cluster_count} clusters")
-            write_bcl_and_stats(
-                cycle,
-                cluster_count,
-                rundir,
-                (sequence for sequence, _position in _iter_lane_records(lane, lane_samples, exclude_umi, exclude_index)),
-                lane,
-            )
 
     return run_id, rundir, seqdesc_fields, mask_string
 

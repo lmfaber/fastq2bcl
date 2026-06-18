@@ -3,9 +3,32 @@ import gzip
 from fastq2bcl.parser import parse_seqdesc_fields
 from Bio import SeqIO
 from rich import print
-import sys
 
 _logger = logging.getLogger(__name__)
+
+
+def iter_raw_fastq_records(fastq_file):
+    """
+    Stream FASTQ records as ``(description, id, sequence, qualities)``.
+
+    ``qualities`` are returned as Phred integers for compatibility with the
+    writer API, but this avoids BioPython record allocation in the hot loop.
+    """
+    with gzip.open(fastq_file, "rt") as fastq_fh:
+        while True:
+            header = fastq_fh.readline()
+            if header == "":
+                break
+            sequence = fastq_fh.readline().rstrip("\n\r")
+            plus = fastq_fh.readline()
+            quality = fastq_fh.readline().rstrip("\n\r")
+            if not sequence or not plus or not quality:
+                raise ValueError(f"Malformed FASTQ record in {fastq_file}")
+            if not header.startswith("@"):
+                raise ValueError(f"Malformed FASTQ header in {fastq_file}: {header.rstrip()}")
+            description = header[1:].rstrip("\n\r")
+            record_id = description.split(None, 1)[0]
+            yield description, record_id, sequence, [ord(char) - 33 for char in quality]
 
 
 def read_first_record(fastq_file):
@@ -30,6 +53,17 @@ def get_file_handlers(r1, r2, i1, i2):
         files_fh.append(gzip.open(r2, "rt"))
 
     return files_fh
+
+
+def get_fastq_paths(r1, r2, i1, i2):
+    files = [r1]
+    if i1 != None:
+        files.append(i1)
+    if i2 != None:
+        files.append(i2)
+    if r2 != None:
+        files.append(r2)
+    return files
 
 
 def get_mask_from_files(r1, r2, i1, i2, exclude_umi, exclude_index):
@@ -86,54 +120,44 @@ def iter_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index):
 
     Each yielded item is ``((sequence, quality), (x_pos, y_pos))``.
     """
-    # build a list of iterators
-    file_handlers = get_file_handlers(r1, r2, i1, i2)
-    seq_iterators = [SeqIO.parse(fh, "fastq") for fh in file_handlers]
+    seq_iterators = [iter_raw_fastq_records(path) for path in get_fastq_paths(r1, r2, i1, i2)]
 
-    try:
-        # iterate over the R1 iterator
-        for r1_record in seq_iterators[0]:
-            # call next in additional iterators
-            try:
-                opt_data = [next(iterator) for iterator in seq_iterators[1:]]
-            except StopIteration:
-                raise ValueError("FASTQ files do not contain the same number of records")
+    for r1_description, record_id, record_seq, record_qual in seq_iterators[0]:
+        try:
+            opt_data = [next(iterator) for iterator in seq_iterators[1:]]
+        except StopIteration:
+            raise ValueError("FASTQ files do not contain the same number of records")
 
-            # store R1 data
-            record_fields = parse_seqdesc_fields(r1_record.description)
-            record_id = r1_record.id
-            record_seq = str(r1_record.seq)
-            record_qual = r1_record.letter_annotations["phred_quality"]
+        record_fields = parse_seqdesc_fields(r1_description)
 
-            if not exclude_index and record_fields["index"] != "1":
-                _logger.info(f"Reading index field: {record_fields['index']}")
-                record_seq += record_fields["index"]
-                _logger.info(f"New seq len: {len(record_seq)} seq: {record_seq}")
-                record_qual += [40] * len(record_fields["index"])
-                _logger.info(f"New qual: {record_qual}")
+        if not exclude_index and record_fields["index"] != "1":
+            _logger.info(f"Reading index field: {record_fields['index']}")
+            record_seq += record_fields["index"]
+            record_qual += [40] * len(record_fields["index"])
 
-            # the UMI is quality MAX (40)
-            if not exclude_umi and record_fields["UMI"] != None:
-                _logger.info(f"Reading umi field: {record_fields['UMI']}")
-                record_seq += record_fields["UMI"]
-                _logger.info(f"New seq len: {len(record_seq)} seq: {record_seq}")
-                record_qual += [40] * len(record_fields["UMI"])
-                _logger.info(f"New qual: {record_qual}")
+        # the UMI is quality MAX (40)
+        if not exclude_umi and record_fields["UMI"] != None:
+            _logger.info(f"Reading umi field: {record_fields['UMI']}")
+            record_seq += record_fields["UMI"]
+            record_qual += [40] * len(record_fields["UMI"])
 
-            for opt_record in opt_data:
-                if opt_record.id != record_id:
-                    raise ValueError(f"Seq ID mismatch for record {opt_record.id} R1 is {record_id}")
-                record_seq += str(opt_record.seq)
-                record_qual += opt_record.letter_annotations["phred_quality"]
+        for _description, opt_record_id, opt_seq, opt_qual in opt_data:
+            if opt_record_id != record_id:
+                raise ValueError(f"Seq ID mismatch for record {opt_record_id} R1 is {record_id}")
+            record_seq += opt_seq
+            record_qual += opt_qual
 
-            yield (record_seq, record_qual), (
-                record_fields["x_pos"],
-                record_fields["y_pos"],
-            )
-    finally:
-        # close all files
-        for file_fh in file_handlers:
-            file_fh.close()
+        yield (record_seq, record_qual), (
+            record_fields["x_pos"],
+            record_fields["y_pos"],
+        )
+
+    for iterator in seq_iterators[1:]:
+        try:
+            next(iterator)
+        except StopIteration:
+            continue
+        raise ValueError("FASTQ files do not contain the same number of records")
 
 
 def iter_fastq_cycle_data(cycle, r1, r2, i1, i2, exclude_umi, exclude_index):
@@ -156,7 +180,9 @@ def count_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index):
 
 def read_fastq_files(r1, r2, i1, i2, exclude_umi, exclude_index):
     """
-    Read fastq files R1-R2 with I1 and I2 and return only the data we need
+    Compatibility helper that materializes FASTQ data in memory.
+
+    Production code should use ``iter_fastq_records`` instead.
     """
     # return a list of tuple with seq, qual
     # and a list of tuple for pos with x and y
