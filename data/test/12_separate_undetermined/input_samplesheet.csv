@@ -1,0 +1,6 @@
+lane,r1,r2,i1,i2,project,sample
+1,sample1_R1.fastq.gz,sample1_R2.fastq.gz,,,project1,sample1
+2;3;4;5;6;7;8,sample2_R1.fastq.gz,sample2_R2.fastq.gz,,,project2,sample2
+8,sample3_R1.fastq.gz,sample3_R2.fastq.gz,,,project3,sample3
+1,undetermined_lane1_R1.fastq.gz,undetermined_lane1_R2.fastq.gz,,,undetermined,
+8,undetermined_lane8_R1.fastq.gz,undetermined_lane8_R2.fastq.gz,,,undetermined,
