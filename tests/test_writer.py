@@ -28,6 +28,10 @@ excepted_xml = """<?xml version="1.0"?>
             <Read NumCycles="110" Number="1" IsIndexedRead="N" />
         </Reads>
         <FlowcellLayout LaneCount="1" SurfaceCount="1" SwathCount="1" TileCount="1" />
+        <ImageChannels>
+            <Name>Green</Name>
+            <Name>Red</Name>
+        </ImageChannels>
     </Run>
 </RunInfo>
 """

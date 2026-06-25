@@ -1,7 +1,6 @@
 import logging
 import struct
 import csv
-from contextlib import ExitStack
 from pathlib import Path
 
 from fastq2bcl.parser import parse_seqdesc_fields
@@ -12,6 +11,7 @@ _logger = logging.getLogger(__name__)
 BASE_TO_BITS = {ord("A"): 0, ord("C"): 1, ord("G"): 2, ord("T"): 3}
 BASE_TO_BITS.update({ord("a"): 0, ord("c"): 1, ord("g"): 2, ord("t"): 3})
 WRITE_CHUNK_SIZE = 1024 * 1024
+BCL_BUFFER_LIMIT = 64 * 1024
 
 
 def format_lane(lane):
@@ -59,6 +59,10 @@ def generate_run_info_xml(run_id, run_number, flowcell_id, instrument, mask, lan
             { xml_mask }
         </Reads>
         <FlowcellLayout LaneCount="{lane_count}" SurfaceCount="1" SwathCount="1" TileCount="1" />
+        <ImageChannels>
+            <Name>Green</Name>
+            <Name>Red</Name>
+        </ImageChannels>
     </Run>
 </RunInfo>
 """
@@ -171,6 +175,13 @@ def encode_cluster_value(base, qual):
     return (qual << 2) | encoded_base
 
 
+def encode_cluster_value_bytes(base, qual):
+    encoded_base = BASE_TO_BITS.get(base)
+    if encoded_base == None:
+        return 0
+    return ((qual - 33) << 2) | encoded_base
+
+
 def init_bcl_and_write_cluster_counts(cycledir, cluster_count, filename="s_1_1101.bcl"):
     """
     Create bcl file and write cluster count
@@ -235,59 +246,84 @@ def write_bcl_and_stats(cycle, cluster_count, outdir, sequences, lane=1):
     write_stat_file(cycledir / f"{format_tile(lane)}.stats")
 
 
+class LaneBclWriter:
+    def __init__(self, outdir, lane, cluster_count, cycles):
+        self.outdir = Path(outdir)
+        self.lane = lane
+        self.cluster_count = cluster_count
+        self.cycles = cycles
+        self.tile = format_tile(lane)
+        self.positions_count = 0
+        self.buffers = [bytearray() for _cycle in range(cycles)]
+        self.cycle_files = []
+
+        for cycle in range(cycles):
+            cycledir = get_cycle_dir(self.outdir, cycle, lane)
+            init_bcl_and_write_cluster_counts(cycledir, cluster_count, f"{self.tile}.bcl")
+            self.cycle_files.append(cycledir / f"{self.tile}.bcl")
+
+        locs_path = self.outdir / f"Data/Intensities/{format_lane(lane)}/{self.tile}.locs"
+        locs_path.parent.mkdir(exist_ok=True, parents=True)
+        self.locs_out = open(locs_path, "wb")
+        self.locs_out.write(bytes([1, 0, 0, 0, 0, 0, 0x80, 0x3F]))
+        self.locs_out.write(struct.pack("<I", 0))
+
+    def write_record(self, sequence, quality, position):
+        self.locs_out.write(encode_loc_bytes(position[0], position[1]))
+        self.positions_count += 1
+
+        read_length = len(sequence)
+        for cycle in range(self.cycles):
+            if cycle >= read_length:
+                self.buffers[cycle].append(0)
+            else:
+                self.buffers[cycle].append(encode_cluster_value_bytes(sequence[cycle], quality[cycle]))
+
+            if len(self.buffers[cycle]) >= BCL_BUFFER_LIMIT:
+                self.flush_cycle(cycle)
+
+    def flush_cycle(self, cycle):
+        if not self.buffers[cycle]:
+            return
+        with open(self.cycle_files[cycle], "ab") as f_out:
+            f_out.write(self.buffers[cycle])
+        self.buffers[cycle].clear()
+
+    def close(self):
+        try:
+            for cycle in range(self.cycles):
+                self.flush_cycle(cycle)
+
+            self.locs_out.seek(8)
+            self.locs_out.write(struct.pack("<I", self.positions_count))
+        finally:
+            self.locs_out.close()
+
+        for filename in self.cycle_files:
+            write_stat_file(filename.with_suffix(".stats"))
+
+        if self.positions_count != self.cluster_count:
+            raise ValueError(
+                f"Location count {self.positions_count} does not match cluster count {self.cluster_count} "
+                f"for lane {self.lane}"
+            )
+
+
 def write_lane_bcls_and_locs(outdir, cluster_count, cycles, records, lane=1):
     """
     Stream lane records once and write locs plus all cycle BCL files.
     """
-    tile = format_tile(lane)
-    cycle_files = []
-    for cycle in range(cycles):
-        cycledir = get_cycle_dir(outdir, cycle, lane)
-        init_bcl_and_write_cluster_counts(cycledir, cluster_count, f"{tile}.bcl")
-        cycle_files.append(cycledir / f"{tile}.bcl")
-
-    locs_path = Path(outdir) / f"Data/Intensities/{format_lane(lane)}/{tile}.locs"
-    locs_path.parent.mkdir(exist_ok=True, parents=True)
-
-    buffers = [bytearray() for _cycle in range(cycles)]
-    positions_count = 0
-
-    with ExitStack() as stack:
-        locs_out = stack.enter_context(open(locs_path, "wb"))
-        locs_out.write(bytes([1, 0, 0, 0, 0, 0, 0x80, 0x3F]))
-        locs_out.write(struct.pack("<I", 0))
-
-        bcl_outputs = [stack.enter_context(open(filename, "ab")) for filename in cycle_files]
-
+    writer = LaneBclWriter(outdir, lane, cluster_count, cycles)
+    try:
         for (basecalls, qualscores), position in records:
-            locs_out.write(encode_loc_bytes(position[0], position[1]))
-            positions_count += 1
+            if isinstance(basecalls, str):
+                basecalls = basecalls.encode()
+                qualscores = bytes(qual + 33 for qual in qualscores)
+            writer.write_record(basecalls, qualscores, position)
+    finally:
+        writer.close()
 
-            read_length = len(basecalls)
-            for cycle in range(cycles):
-                if cycle >= read_length:
-                    buffers[cycle].append(0)
-                else:
-                    buffers[cycle].append(encode_cluster_value(basecalls[cycle], qualscores[cycle]))
-
-                if len(buffers[cycle]) >= WRITE_CHUNK_SIZE:
-                    bcl_outputs[cycle].write(buffers[cycle])
-                    buffers[cycle].clear()
-
-        for cycle, buffer in enumerate(buffers):
-            if buffer:
-                bcl_outputs[cycle].write(buffer)
-
-        locs_out.seek(8)
-        locs_out.write(struct.pack("<I", positions_count))
-
-    for filename in cycle_files:
-        write_stat_file(filename.with_suffix(".stats"))
-
-    if positions_count != cluster_count:
-        raise ValueError(f"Location count {positions_count} does not match cluster count {cluster_count}")
-
-    return positions_count
+    return writer.positions_count
 
 
 def write_stat_file(filename):

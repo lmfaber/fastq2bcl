@@ -1,6 +1,6 @@
 import logging
 import gzip
-from fastq2bcl.parser import parse_seqdesc_fields
+from fastq2bcl.parser import parse_seqdesc_fields, parse_seqdesc_fast_bytes
 from Bio import SeqIO
 from rich import print
 
@@ -14,21 +14,21 @@ def iter_raw_fastq_records(fastq_file):
     ``qualities`` are returned as Phred integers for compatibility with the
     writer API, but this avoids BioPython record allocation in the hot loop.
     """
-    with gzip.open(fastq_file, "rt") as fastq_fh:
+    with gzip.open(fastq_file, "rb") as fastq_fh:
         while True:
             header = fastq_fh.readline()
-            if header == "":
+            if header == b"":
                 break
-            sequence = fastq_fh.readline().rstrip("\n\r")
+            sequence = fastq_fh.readline().rstrip(b"\n\r")
             plus = fastq_fh.readline()
-            quality = fastq_fh.readline().rstrip("\n\r")
+            quality = fastq_fh.readline().rstrip(b"\n\r")
             if not sequence or not plus or not quality:
                 raise ValueError(f"Malformed FASTQ record in {fastq_file}")
-            if not header.startswith("@"):
-                raise ValueError(f"Malformed FASTQ header in {fastq_file}: {header.rstrip()}")
-            description = header[1:].rstrip("\n\r")
+            if not header.startswith(b"@"):
+                raise ValueError(f"Malformed FASTQ header in {fastq_file}: {header.rstrip().decode(errors='replace')}")
+            description = header[1:].rstrip(b"\n\r")
             record_id = description.split(None, 1)[0]
-            yield description, record_id, sequence, [ord(char) - 33 for char in quality]
+            yield description, record_id, sequence, quality
 
 
 def read_first_record(fastq_file):
@@ -64,6 +64,50 @@ def get_fastq_paths(r1, r2, i1, i2):
     if r2 != None:
         files.append(r2)
     return files
+
+
+def iter_fastq_records_bytes(r1, r2, i1, i2, exclude_umi, exclude_index):
+    """
+    Stream FASTQ records as bytes for the production writer path.
+
+    Each yielded item is ``((sequence_bytes, quality_ascii_bytes), (x_pos, y_pos))``.
+    Synthetic index and UMI qualities are encoded as ``I`` (Phred 40).
+    """
+    seq_iterators = [iter_raw_fastq_records(path) for path in get_fastq_paths(r1, r2, i1, i2)]
+
+    for r1_description, record_id, record_seq, record_qual in seq_iterators[0]:
+        try:
+            opt_data = [next(iterator) for iterator in seq_iterators[1:]]
+        except StopIteration:
+            raise ValueError("FASTQ files do not contain the same number of records")
+
+        x_pos, y_pos, index, umi = parse_seqdesc_fast_bytes(r1_description)
+
+        if not exclude_index and index != b"1":
+            record_seq += index
+            record_qual += b"I" * len(index)
+
+        if not exclude_umi and umi != None:
+            record_seq += umi
+            record_qual += b"I" * len(umi)
+
+        for _description, opt_record_id, opt_seq, opt_qual in opt_data:
+            if opt_record_id != record_id:
+                raise ValueError(
+                    f"Seq ID mismatch for record {opt_record_id.decode(errors='replace')} "
+                    f"R1 is {record_id.decode(errors='replace')}"
+                )
+            record_seq += opt_seq
+            record_qual += opt_qual
+
+        yield (record_seq, record_qual), (x_pos, y_pos)
+
+    for iterator in seq_iterators[1:]:
+        try:
+            next(iterator)
+        except StopIteration:
+            continue
+        raise ValueError("FASTQ files do not contain the same number of records")
 
 
 def get_mask_from_files(r1, r2, i1, i2, exclude_umi, exclude_index):
@@ -120,44 +164,13 @@ def iter_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index):
 
     Each yielded item is ``((sequence, quality), (x_pos, y_pos))``.
     """
-    seq_iterators = [iter_raw_fastq_records(path) for path in get_fastq_paths(r1, r2, i1, i2)]
-
-    for r1_description, record_id, record_seq, record_qual in seq_iterators[0]:
-        try:
-            opt_data = [next(iterator) for iterator in seq_iterators[1:]]
-        except StopIteration:
-            raise ValueError("FASTQ files do not contain the same number of records")
-
-        record_fields = parse_seqdesc_fields(r1_description)
-
-        if not exclude_index and record_fields["index"] != "1":
-            _logger.info(f"Reading index field: {record_fields['index']}")
-            record_seq += record_fields["index"]
-            record_qual += [40] * len(record_fields["index"])
-
-        # the UMI is quality MAX (40)
-        if not exclude_umi and record_fields["UMI"] != None:
-            _logger.info(f"Reading umi field: {record_fields['UMI']}")
-            record_seq += record_fields["UMI"]
-            record_qual += [40] * len(record_fields["UMI"])
-
-        for _description, opt_record_id, opt_seq, opt_qual in opt_data:
-            if opt_record_id != record_id:
-                raise ValueError(f"Seq ID mismatch for record {opt_record_id} R1 is {record_id}")
-            record_seq += opt_seq
-            record_qual += opt_qual
-
-        yield (record_seq, record_qual), (
-            record_fields["x_pos"],
-            record_fields["y_pos"],
+    for (record_seq, record_qual), (x_pos, y_pos) in iter_fastq_records_bytes(
+        r1, r2, i1, i2, exclude_umi, exclude_index
+    ):
+        yield (record_seq.decode(), [qual - 33 for qual in record_qual]), (
+            x_pos.decode(),
+            y_pos.decode(),
         )
-
-    for iterator in seq_iterators[1:]:
-        try:
-            next(iterator)
-        except StopIteration:
-            continue
-        raise ValueError("FASTQ files do not contain the same number of records")
 
 
 def iter_fastq_cycle_data(cycle, r1, r2, i1, i2, exclude_umi, exclude_index):
@@ -175,7 +188,13 @@ def count_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index):
     """
     Count records without retaining FASTQ data in memory.
     """
-    return sum(1 for _record in iter_fastq_records(r1, r2, i1, i2, exclude_umi, exclude_index))
+    line_count = 0
+    with gzip.open(r1, "rb") as fastq_fh:
+        for line_count, _line in enumerate(fastq_fh, start=1):
+            pass
+    if line_count % 4 != 0:
+        raise ValueError(f"Malformed FASTQ file {r1}: line count is not divisible by 4")
+    return line_count // 4
 
 
 def read_fastq_files(r1, r2, i1, i2, exclude_umi, exclude_index):

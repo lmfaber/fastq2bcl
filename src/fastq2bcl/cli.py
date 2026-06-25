@@ -31,6 +31,7 @@ from fastq2bcl.reader import (
     read_first_record,
     get_mask_from_files,
     iter_fastq_records,
+    iter_fastq_records_bytes,
     count_fastq_records,
 )
 from fastq2bcl.writer import (
@@ -38,7 +39,7 @@ from fastq2bcl.writer import (
     write_filter,
     write_control,
     write_sample_sheet,
-    write_lane_bcls_and_locs,
+    LaneBclWriter,
 )
 
 __author__ = "Davide Rambaldi"
@@ -224,6 +225,49 @@ def _count_lane_records(lane, lane_samples, exclude_umi, exclude_index):
         start, end = _sample_lane_bounds(sample, lane, exclude_umi, exclude_index)
         total += end - start
     return total
+
+
+def _sample_lane_ranges(sample, exclude_umi, exclude_index):
+    ranges = []
+    for lane in sample["lanes"]:
+        start, end = _sample_lane_bounds(sample, lane, exclude_umi, exclude_index)
+        if start != end:
+            ranges.append((start, end, lane))
+    ranges.sort()
+    return ranges
+
+
+def _write_sample_records_to_lanes(sample, lane_writers, exclude_umi, exclude_index):
+    ranges = _sample_lane_ranges(sample, exclude_umi, exclude_index)
+    expected_count = _sample_record_count(sample, exclude_umi, exclude_index)
+    range_index = 0
+    actual_count = 0
+
+    for record_index, record in enumerate(
+        iter_fastq_records_bytes(
+            sample["r1"],
+            sample["r2"],
+            sample["i1"],
+            sample["i2"],
+            exclude_umi,
+            exclude_index,
+        )
+    ):
+        actual_count += 1
+        while range_index < len(ranges) and record_index >= ranges[range_index][1]:
+            range_index += 1
+        if range_index >= len(ranges):
+            raise ValueError(f"More records than expected for sample {sample['sample_id']}")
+
+        _start, _end, lane = ranges[range_index]
+        (sequence, quality), position = record
+        lane_writers[lane].write_record(sequence, quality, position)
+
+    if actual_count != expected_count:
+        raise ValueError(
+            f"Record count {actual_count} does not match expected count {expected_count} "
+            f"for sample {sample['sample_id']}"
+        )
 
 
 def _sample_index_key(sample):
@@ -415,6 +459,7 @@ def fastq2bcl(
     print(f"[green]RunInfo.xml:[/green]:\n", run_info)
     write_sample_sheet(rundir, samples, mask, sample_sheet_format, exclude_index)
 
+    lane_writers = {}
     for lane, lane_samples in sorted(samples_by_lane.items()):
         cluster_count = _count_lane_records(lane, lane_samples, exclude_umi, exclude_index)
 
@@ -428,16 +473,16 @@ def fastq2bcl(
         _logger.info(f"Writing control file to dir: {rundir} with cluster count: {cluster_count}")
         write_control(rundir, cluster_count, lane)
 
-        # WRITE LOCATIONS, BCL AND STATS
-        print(f"[bold magenta]Writing location and cycle files for lane {lane}[/bold magenta]")
-        _logger.info(f"Writing {cluster_count} records to dir: {rundir}")
-        write_lane_bcls_and_locs(
-            rundir,
-            cluster_count,
-            cycles,
-            _iter_lane_records(lane, lane_samples, exclude_umi, exclude_index),
-            lane,
-        )
+        print(f"[bold magenta]Initializing location and cycle files for lane {lane}[/bold magenta]")
+        lane_writers[lane] = LaneBclWriter(rundir, lane, cluster_count, cycles)
+
+    try:
+        for sample in samples:
+            print(f"[bold magenta]Streaming sample {sample['sample_id']}[/bold magenta]")
+            _write_sample_records_to_lanes(sample, lane_writers, exclude_umi, exclude_index)
+    finally:
+        for lane in sorted(lane_writers):
+            lane_writers[lane].close()
 
     return run_id, rundir, seqdesc_fields, mask_string
 

@@ -35,6 +35,36 @@ VALID_KEYS = [
 ]
 
 
+def parse_seqdesc_fast_bytes(txt):
+    """
+    Parse hot-path fields from an Illumina FASTQ description as bytes.
+
+    Returns ``(x_pos, y_pos, index, umi)`` where ``umi`` is ``None`` when absent.
+    """
+    first, sep, rest = txt.partition(b" ")
+    if not sep:
+        first, sep, rest = txt.partition(b"\t")
+    if not sep:
+        raise ValueError(f"Sequence identifier not recognized: {txt.decode(errors='replace')}")
+
+    fields = first.split(b":")
+    if len(fields) == 7:
+        umi = None
+    elif len(fields) == 8:
+        umi = fields[7]
+    else:
+        raise ValueError(f"Sequence identifier not recognized: {txt.decode(errors='replace')}")
+
+    if not fields[5] or not fields[6]:
+        raise ValueError(f"Requested Key x_pos or y_pos not Found in fastq description")
+
+    read_info = rest.split(None, 1)[0].split(b":", 3)
+    if len(read_info) != 4 or not read_info[3]:
+        raise ValueError(f"Sequence identifier not recognized: {txt.decode(errors='replace')}")
+
+    return fields[5], fields[6], read_info[3], umi
+
+
 def parse_seqdesc_fields(txt):
     """
     Parse the SeqIO description field using named groups.
